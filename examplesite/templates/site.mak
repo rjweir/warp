@@ -7,10 +7,12 @@
     <title>Warp Example Site</title>
 
     <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico"></link>
-    <link rel="stylesheet" href="/css/site.css" type="text/css"></link>
 
-    <script type="text/javascript" src="/warp/jquery-1.3.2.min.js"></script>
-    <script type="text/javascript" src="/warp/jquery.comet.js"></script>
+<%include file="/standard/includes.mak" />
+<%include file="/jqgrid/includes.mak" />
+
+    <link rel="stylesheet" href="/css/site.css" type="text/css"></link>
+    <link rel="stylesheet" href="/_warp/warp.css" type="text/css"></link>
 
   </head>
 

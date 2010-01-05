@@ -2,22 +2,31 @@ import os.path
 
 from zope.interface import implements
 
+from twisted.python import util
+from twisted.python.filepath import FilePath, InsecurePath
+
 from twisted.web.resource import IResource
 from twisted.web.error import NoResource
 from twisted.web import static
-from twisted.python.filepath import FilePath, InsecurePath
-
-from mako.template import Template
-from mako.lookup import TemplateLookup
 
 from warp.webserver import auth, comet
-from warp.runtime import config
+from warp.runtime import config, store, templateLookup
+from warp import helpers
+
 
 if '.ico' not in static.File.contentTypes:
     static.File.contentTypes['.ico'] = 'image/vnd.microsoft.icon'
 
 
-templateLookup = None
+
+def getNode(name):
+    node = helpers.getNode(name)
+        
+    if node is None:
+        return NoResource()
+
+    return NodeResource(node)
+
 
 class WarpResourceWrapper(object):
     implements(IResource)
@@ -25,10 +34,22 @@ class WarpResourceWrapper(object):
     isLeaf = False
 
     def __init__(self):
-        global templateLookup
-        lookupDir = config['siteDir'].child("templates").path
-        templateLookup = TemplateLookup(directories=[lookupDir])
+        self.warpBasePath = FilePath(__file__).parent().parent()
+        self.warpStaticPath = self.warpBasePath.child('static')
+        self.warpTemplatePath = self.warpBasePath.child("templates")
 
+        siteTemplateDir = config['siteDir'].child("templates").path
+        warpTemplateDir = self.warpTemplatePath.path
+        templateLookup.__init__(directories=[siteTemplateDir, warpTemplateDir])
+
+
+        self.dispatch =  {
+            '__login__': self.handle_login,
+            '__logout__': self.handle_logout,
+            '_comet': self.handle_comet,
+            '_warp': self.handle_warpstatic,
+            '': self.handle_default,
+        }     
 
 
     def getChildWithDefault(self, firstSegment, request):
@@ -43,37 +64,48 @@ class WarpResourceWrapper(object):
         if session is not None:
             request.avatar = session.avatar
 
-        if firstSegment == '__login__':
-            return auth.LoginHandler()
-        elif firstSegment == '__logout__':
-            return auth.LogoutHandler()
-        elif firstSegment == '_comet':
-            return NodeResource(comet)
-        elif not firstSegment:
-            return Redirect(config['default'])
+        handler = self.dispatch.get(firstSegment)
 
-        return self.getNode(firstSegment)
+        if handler is not None:
+            return handler(request)
+
+        return getNode(firstSegment)
 
 
     def buildFilePath(self, request):
         filePath = config['siteDir'].child('static')
         for segment in request.path.split('/'):
-            try:
-                filePath = filePath.child(segment)
-            except InsecurePath:
-                return None
+            try: filePath = filePath.child(segment)
+            except InsecurePath: return None
 
         if filePath.exists() and filePath.isfile():
             return filePath
 
 
-    def getNode(self, name):
-        node = getattr(__import__("nodes", fromlist=[name]), name, None)
-        
-        if node is None:
-            return NoResource()
+    def handle_login(self, request):
+        return auth.LoginHandler()
 
-        return NodeResource(node)
+    def handle_logout(self, request):
+        return auth.LogoutHandler()
+
+    def handle_comet(self, request):
+        return NodeResource(comet)
+
+    def handle_warpstatic(self, request):
+        filePath = self.warpStaticPath
+        for segment in request.path.split('/')[2:]:
+            try: filePath = filePath.child(segment)
+            except InsecurePath: return None
+
+        if filePath.exists() and filePath.isfile():
+            del request.postpath[:]
+            return static.File(filePath.path)
+
+        return NoResource()
+
+    def handle_default(self, request):
+        return Redirect(config['default'])
+
 
 
 class Redirect(object):
@@ -104,45 +136,75 @@ class NodeResource(object):
         
 
     def getChildWithDefault(self, segment, request):
-        self.facetName = segment
-        self.isLeaf = True
-        return self
+
+        if not segment:
+            return Redirect(request.childLink('index'))
+
+        renderFunc = self.getRenderFunc(segment)
+        if renderFunc is not None:
+            self.facetName = segment
+            self.renderFunc = renderFunc
+            self.isLeaf = True
+            return self
+
+        subNode = self.getSubNode(segment)
+        if subNode is not None:
+            return NodeResource(subNode)
+
+        return NoResource()
 
             
     def render(self, request):
-        self.args = request.postpath            
 
         if not self.facetName:
             request.redirect(request.childLink('index'))
             return "Redirecting..."
 
-        renderFunc = getattr(self.node, 'render_%s' % self.facetName, None)
+        self.args = request.postpath
+
+        request.node = self.node
+        request.resource = self
+
+        # Should be configurable somehow
+        request.setHeader("Pragma", "no-cache")
+        request.setHeader("Expires", "-1")
+
+        return self.renderFunc(request)
+
+
+    def getRenderFunc(self, facetName):
+
+        renderFunc = getattr(self.node, 'render_%s' % facetName, None)
         if renderFunc is not None:
-            return renderFunc(request)
+            return renderFunc
 
-        templatePath = self.getTemplate()
+        templatePath = self.getTemplate(facetName)
         if templatePath is not None:
-            return self.renderTemplate(templatePath, request)
+            return lambda r: helpers.renderTemplate(r, templatePath.path)
 
-        return NoResource().render(request)
+        renderer = getattr(self.node, 'renderer', None)
+        if renderer is not None:
+            renderMethod = getattr(renderer, 'render_%s' % facetName, None)
+            if renderMethod is not None:
+                return renderMethod
+
+        return None
 
 
-    def getTemplate(self):
+    def getTemplate(self, facetName):
         templatePath = FilePath(
             self.node.__file__
-            ).sibling(self.facetName + ".mak")
+            ).sibling(facetName + ".mak")
 
         if templatePath.exists():
             return templatePath
 
 
-    def renderTemplate(self, templatePath, request):
-        template = Template(filename=templatePath.path,
-                            lookup=templateLookup,
-                            format_exceptions=True)
-
-        return template.render(node=self.node,
-                               request=request)
+    def getSubNode(self, nodeName):
+        currentPackage = self.node.__name__.rsplit('.', 1)[0]
+        return getattr(__import__("%s.%s" % (currentPackage, nodeName), 
+                                  fromlist=[nodeName]), 
+                       nodeName, None)
 
 
     def __repr__(self):
